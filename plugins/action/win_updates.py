@@ -659,6 +659,16 @@ _TRANSPORT_HRESULT_RANGES = (
     (0x80244000, 0x80244FFF),  # "Protocol Talker" / WU_E_PT_* errors
 )
 
+# Individual, non-WUA HRESULTs observed reaching the configured update
+# endpoint over HTTP(S) rather than coming back from the WUA search/install
+# API itself. Listed explicitly (not as a range) since these come from the
+# much broader Win32/WinINET/CryptoAPI error spaces, where a range would risk
+# the same false-positive this module's 0x80244000-0x80244FFF range avoids.
+_TRANSPORT_HRESULT_CODES = (
+    0x80072EE2,  # WININET_E_TIMEOUT, reaching WSUS/Microsoft Update - ansible-collections/ansible.windows#600
+    0x800B010F,  # CERT_E_CN_NO_MATCH, TLS certificate mismatch talking to WSUS - ansible-collections/ansible.windows#876
+)
+
 
 def _categorize_hresult(error_id, hresult):  # type: (str, int) -> str
     """Groups a known WUA HRESULT into a coarse, locale-independent category a
@@ -668,7 +678,11 @@ def _categorize_hresult(error_id, hresult):  # type: (str, int) -> str
     make their own judgement call, same as before this field existed.
     """
     masked = hresult & 0xFFFFFFFF
-    if error_id.startswith('WU_E_PT_') or any(low <= masked <= high for low, high in _TRANSPORT_HRESULT_RANGES):
+    if (
+        error_id.startswith('WU_E_PT_')
+        or any(low <= masked <= high for low, high in _TRANSPORT_HRESULT_RANGES)
+        or masked in _TRANSPORT_HRESULT_CODES
+    ):
         return 'transport'
     if error_id == 'WU_E_SERVICE_STOP':
         return 'service_stopped'

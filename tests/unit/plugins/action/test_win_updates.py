@@ -816,6 +816,9 @@ def test_get_hresult_error_formats_the_info_tuple():
     ('WU_E_SERVICE_STOP', 0x8024001E, 'service_stopped'),
     ('WU_E_ALL_UPDATES_FAILED', 0x80240022, 'unknown'),
     ('UNKNOWN', 0x12345678, 'unknown'),
+    # Non-WUA HRESULTs reaching the update endpoint, reported upstream.
+    ('UNKNOWN', 0x80072EE2, 'transport'),  # ansible-collections/ansible.windows#600
+    ('UNKNOWN', 0x800B010F, 'transport'),  # ansible-collections/ansible.windows#876
 ])
 def test_categorize_hresult(error_id, hresult, expected):
     assert win_updates._categorize_hresult(error_id, hresult) == expected

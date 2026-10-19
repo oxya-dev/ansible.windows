@@ -378,10 +378,11 @@ failure_category:
     - A coarse, locale-independent classification of I(error_id)/I(hresult),
       for callers that need to branch on the failure without parsing
       I(msg).
-    - C(transport) - a WU_E_PT_* / Protocol Talker failure reaching the
-      configured update endpoint (WSUS or Microsoft Update). Resetting the
-      connection to the host and replaying the same operation will not fix
-      this, the update source itself needs attention.
+    - C(transport) - a WU_E_PT_* / Protocol Talker failure, or another known
+      non-WUA HRESULT (e.g. a WinINET timeout or a TLS certificate mismatch)
+      reaching the configured update endpoint (WSUS or Microsoft Update).
+      Resetting the connection to the host and replaying the same operation
+      will not fix this, the update source itself needs attention.
     - C(service_stopped) - the Windows Update Agent service was stopping or
       shutting down (C(WU_E_SERVICE_STOP)); often transient, worth a plain
       retry.
