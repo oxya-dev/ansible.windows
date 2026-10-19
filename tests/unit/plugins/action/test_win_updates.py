@@ -8,7 +8,9 @@ import os
 import re
 from unittest.mock import MagicMock
 
-from ansible.errors import AnsibleConnectionFailure
+import pytest
+
+from ansible.errors import AnsibleActionFail, AnsibleConnectionFailure
 from ansible.playbook.task import Task
 from ansible_collections.ansible.windows.plugins.action import win_updates
 
@@ -444,6 +446,9 @@ def test_install_reboot_with_two_failures(monkeypatch):
     assert actual['msg'] == 'Searching for updates: Exception from HRESULT: 0x80240032 - The search criteria string was invalid ' \
         '(WU_E_INVALID_CRITERIA 0x80240032)'
     assert 'exception' in actual
+    assert actual['hresult'] == 2149842994
+    assert actual['error_id'] == 'WU_E_INVALID_CRITERIA'
+    assert actual['failure_category'] == 'unknown'
     assert actual['found_update_count'] == 0
     assert actual['failed_update_count'] == 0
     assert actual['installed_update_count'] == 0
@@ -538,6 +543,9 @@ def test_fail_install(monkeypatch):
     assert actual['found_update_count'] == 2
     assert actual['failed_update_count'] == 1
     assert actual['installed_update_count'] == 1
+    assert 'hresult' not in actual
+    assert 'error_id' not in actual
+    assert 'failure_category' not in actual
 
     assert len(actual['filtered_updates']) == 4
     for u_id, u in actual['filtered_updates'].items():
@@ -568,6 +576,7 @@ def test_fail_install(monkeypatch):
         if u_info['kb'] == '2267602':
             assert not u['installed']
             assert u['failure_hresult_code'] == 2147944003
+            assert u['failure_error_id'] == 'UNKNOWN'
             assert u['failure_msg'] == 'Unknown WUA HRESULT 2147944003 (UNKNOWN 0x80070643)'
 
         else:
@@ -617,7 +626,8 @@ def test_connection_failures_during_poll(monkeypatch):
         assert u['installed']
 
     assert mock_warning.call_count == 1
-    assert mock_warning.mock_calls[0][1] == ('Connection failure when polling update result - attempting to retry: connection error',)
+    assert mock_warning.mock_calls[0][1] == (
+        'Connection failure when polling update result - attempting to retry (2/2): connection error',)
 
 
 def test_multiple_connection_failures_during_poll(monkeypatch):
@@ -631,7 +641,8 @@ def test_multiple_connection_failures_during_poll(monkeypatch):
     assert actual['msg'] == 'connection error'
 
     assert mock_warning.call_count == 3
-    assert mock_warning.mock_calls[0][1] == ('Connection failure when polling update result - attempting to retry: connection error',)
+    assert mock_warning.mock_calls[0][1] == (
+        'Connection failure when polling update result - attempting to retry (2/2): connection error',)
     assert mock_warning.mock_calls[1][1] == ('Unknown failure when polling update result - attempting to cancel task: connection error',)
     assert mock_warning.mock_calls[2][1] == ('Unknown failure when cancelling update task: connection error',)
 
@@ -648,6 +659,8 @@ def test_repeated_update(monkeypatch):
 
     assert actual['failed']
     assert re.match(r'An update loop was detected,.*\. Updates in the reboot loop are: 501ef1af-14f0-4cb5-aa9b-aa340b9f9d2a', actual['msg'])
+    assert actual['error_id'] == 'update_loop_detected'
+    assert actual['failure_category'] == 'update_loop_detected'
     assert actual['failed_update_count'] == 1
     assert actual['installed_update_count'] == 2
     assert actual['found_update_count'] == 3
@@ -655,6 +668,7 @@ def test_repeated_update(monkeypatch):
     assert actual['updates']['5e406f0e-59fa-432d-bb9a-77d2db6f74ec']['installed']
     assert not actual['updates']['501ef1af-14f0-4cb5-aa9b-aa340b9f9d2a']['installed']
     assert actual['updates']['501ef1af-14f0-4cb5-aa9b-aa340b9f9d2a']['failure_hresult_code'] == -1
+    assert actual['updates']['501ef1af-14f0-4cb5-aa9b-aa340b9f9d2a']['failure_error_id'] == 'UNKNOWN'
     assert actual['updates']['501ef1af-14f0-4cb5-aa9b-aa340b9f9d2a']['failure_msg'] == 'Unknown WUA HRESULT -1 (UNKNOWN 0xFFFFFFFF)'
 
 
@@ -706,3 +720,102 @@ def test_reissued_update(monkeypatch):
     assert actual['installed_update_count'] == 1
     assert actual['updates'][update_id]['installed']
     assert plugin._updates[update_id]['revision_number'] == 201
+
+
+def test_connection_retries_option_allows_surviving_two_consecutive_failures(monkeypatch):
+    # poll_error3.txt has 2 consecutive connection failures before the poll
+    # finally succeeds. The default connection_retries=2 (1 retry) is not
+    # enough to survive this; connection_retries=3 is.
+    mock_warning = MagicMock()
+    monkeypatch.setattr(win_updates.display, "warning", mock_warning)
+    actual = run_action(monkeypatch, 'poll_error3.txt', {
+        'category_names': ['*'],
+        'connection_retries': 3,
+    })
+
+    assert 'failed' not in actual
+    assert 'unreachable' not in actual
+    assert actual['found_update_count'] == 3
+    assert actual['installed_update_count'] == 3
+
+    assert mock_warning.call_count == 2
+    assert mock_warning.mock_calls[0][1] == (
+        'Connection failure when polling update result - attempting to retry (2/3): connection error',)
+    assert mock_warning.mock_calls[1][1] == (
+        'Connection failure when polling update result - attempting to retry (3/3): connection error',)
+
+
+def test_connection_retries_set_to_one_disables_the_retry(monkeypatch):
+    # poll_error1.txt has a single connection failure that the default
+    # connection_retries=2 survives (see test_connection_failures_during_poll).
+    # connection_retries=1 must raise on that very first failure instead.
+    mock_warning = MagicMock()
+    monkeypatch.setattr(win_updates.display, "warning", mock_warning)
+    actual = run_action(monkeypatch, 'poll_error1.txt', {
+        'category_names': ['*'],
+        'connection_retries': 1,
+    })
+
+    assert actual['unreachable']
+    assert actual['msg'] == 'connection error'
+
+    # No "attempting to retry" warning: the single allowed attempt already
+    # failed, so it is raised immediately and only the outer cancel-on-error
+    # handling logs anything.
+    assert mock_warning.call_count == 1
+    assert mock_warning.mock_calls[0][1] == (
+        'Unknown failure when polling update result - attempting to cancel task: connection error',)
+
+
+def test_connection_retry_delay_sleeps_between_poll_retries(monkeypatch):
+    mock_sleep = MagicMock()
+    monkeypatch.setattr(win_updates.time, "sleep", mock_sleep)
+    monkeypatch.setattr(win_updates.display, "warning", MagicMock())
+
+    actual = run_action(monkeypatch, 'poll_error1.txt', {
+        'category_names': ['*'],
+        'connection_retry_delay': 5,
+    })
+
+    assert 'failed' not in actual
+    assert 'unreachable' not in actual
+    mock_sleep.assert_called_once_with(5)
+
+
+def test_connection_retries_must_be_at_least_one():
+    plugin = win_updates_init({'connection_retries': 0})
+    with pytest.raises(AnsibleActionFail, match="'connection_retries' must be at least 1"):
+        plugin.run()
+
+
+def test_get_hresult_info_known_transport_error():
+    assert win_updates._get_hresult_info(0x80244010) == (
+        'WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS',
+        'The number of round trips to the server exceeded the maximum limit',
+    )
+
+
+def test_get_hresult_info_unknown_code():
+    assert win_updates._get_hresult_info(0x12345678) == ('UNKNOWN', 'Unknown WUA HRESULT %s' % 0x12345678)
+
+
+def test_get_hresult_error_formats_the_info_tuple():
+    # Regression check for the _get_hresult_error/_get_hresult_info split:
+    # the combined, human readable string must not change.
+    assert win_updates._get_hresult_error(0x80244010) == (
+        'The number of round trips to the server exceeded the maximum limit '
+        '(WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS 0x80244010)'
+    )
+
+
+@pytest.mark.parametrize('error_id, hresult, expected', [
+    ('WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS', 0x80244010, 'transport'),
+    ('WU_E_PT_REFRESH_CACHE_REQUIRED', 0x80244015, 'transport'),
+    # Not a WU_E_PT_* id, but still inside the Protocol Talker HRESULT range.
+    ('WU_E_PT_SOME_FUTURE_CODE', 0x802445AA, 'transport'),
+    ('WU_E_SERVICE_STOP', 0x8024001E, 'service_stopped'),
+    ('WU_E_ALL_UPDATES_FAILED', 0x80240022, 'unknown'),
+    ('UNKNOWN', 0x12345678, 'unknown'),
+])
+def test_categorize_hresult(error_id, hresult, expected):
+    assert win_updates._categorize_hresult(error_id, hresult) == expected
