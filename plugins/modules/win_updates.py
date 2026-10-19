@@ -57,6 +57,27 @@ options:
         type: int
         default: 1
         version_added: 3.8.0
+    connection_retries:
+        description:
+        - The number of times the action plugin will attempt to re-establish
+          the connection to the host while polling for update progress, when
+          the connection to the host is temporarily lost (e.g. the host is
+          under heavy load while installing updates).
+        - This only applies while polling for progress; it does not retry
+          the initial start of the update operation or the final cancel/exit
+          signal, since those are not safe to blindly replay.
+        - A value of C(1) disables the retry (the first failure is raised
+          immediately).
+        type: int
+        default: 2
+        version_added: 3.9.0
+    connection_retry_delay:
+        description:
+        - The number of seconds to wait between each connection retry
+          described in I(connection_retries).
+        type: int
+        default: 0
+        version_added: 3.9.0
     reboot:
         description:
         - Ansible will automatically reboot the remote host if it is required
@@ -284,6 +305,12 @@ updates:
             returned: on install or download failure
             type: bool
             sample: 2147942402
+        failure_error_id:
+            description: The symbolic WUA error id for I(failure_hresult_code) (e.g. C(WU_E_NO_INTERACTIVE_USER)), or C(UNKNOWN) if not recognised.
+            returned: on install or download failure
+            type: str
+            sample: WU_E_NO_INTERACTIVE_USER
+            version_added: 3.9.0
         failure_msg:
             description: The error message with more details on the failure.
             returned: on install or download failure and not running with async
@@ -325,4 +352,45 @@ failed_update_count:
     returned: always
     type: int
     sample: 0
+
+hresult:
+    description:
+    - The HRESULT code of the overall task failure, when one was captured
+      (an update loop or a reboot-check failure does not carry an HRESULT).
+    - Unlike I(msg), this is a stable numeric value safe to compare in a
+      playbook instead of parsing the human readable error text.
+    returned: on failure, when an HRESULT was captured
+    type: int
+    sample: 2147942402
+    version_added: 3.9.0
+error_id:
+    description:
+    - The symbolic WUA error id for I(hresult) (e.g.
+      C(WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS)), C(UNKNOWN) if the HRESULT isn't
+      recognised, or C(update_loop_detected) when the failure is the update
+      loop described in I(msg) rather than an HRESULT from Windows Update.
+    returned: on failure
+    type: str
+    sample: WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS
+    version_added: 3.9.0
+failure_category:
+    description:
+    - A coarse, locale-independent classification of I(error_id)/I(hresult),
+      for callers that need to branch on the failure without parsing
+      I(msg).
+    - C(transport) - a WU_E_PT_* / Protocol Talker failure reaching the
+      configured update endpoint (WSUS or Microsoft Update). Resetting the
+      connection to the host and replaying the same operation will not fix
+      this, the update source itself needs attention.
+    - C(service_stopped) - the Windows Update Agent service was stopping or
+      shutting down (C(WU_E_SERVICE_STOP)); often transient, worth a plain
+      retry.
+    - C(update_loop_detected) - see I(error_id).
+    - C(unknown) - none of the above; the module cannot tell this failure
+      apart from the HRESULT alone.
+    returned: on failure
+    type: str
+    sample: transport
+    choices: [ transport, service_stopped, update_loop_detected, unknown ]
+    version_added: 3.9.0
 """

@@ -27,6 +27,8 @@ $spec = @{
         reboot = @{ type = 'bool'; default = $false }
         reboot_timeout = @{ type = 'int'; default = 1200 }
         maximum_retries_on_failed_updates = @{ type = 'int'; default = 1 }
+        connection_retries = @{ type = 'int'; default = 2 }
+        connection_retry_delay = @{ type = 'int'; default = 0 }
         _operation = @{ type = 'str'; choices = 'start', 'cancel', 'poll', 'test'; default = 'start' }
         _operation_options = @{ type = 'dict' }
     }

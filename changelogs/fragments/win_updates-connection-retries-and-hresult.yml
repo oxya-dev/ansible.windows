@@ -1,0 +1,9 @@
+minor_changes:
+  - >-
+    win_updates - Added ``connection_retries``/``connection_retry_delay`` options to control how many times (and
+    with how much delay) the action plugin retries a dropped WinRM connection while polling for update progress.
+    Previously this was a single, non-configurable retry.
+  - >-
+    win_updates - Added ``hresult``, ``error_id`` and ``failure_category`` return values on failure, and
+    ``failure_error_id`` alongside each per-update ``failure_hresult_code``, so a caller can branch on a stable,
+    locale-independent value instead of parsing the English ``msg``/``exception`` text.

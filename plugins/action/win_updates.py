@@ -4,6 +4,7 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import time
 import traceback
 
 from ansible.errors import AnsibleActionFail, AnsibleConnectionFailure
@@ -23,10 +24,11 @@ try:
     from typing import (
         Dict,
         Optional,
+        Tuple,
     )
 except ImportError:
     # Satisfy Python 2 which doesn't have typing.
-    Dict = Optional = None
+    Dict = Optional = Tuple = None
 
 from ..plugin_utils._reboot import reboot_host
 
@@ -64,8 +66,8 @@ catch {
 """
 
 
-def _get_hresult_error(hresult):  # type: (int) -> str
-    """Converts a WUA HRESULT to a human readable error message.
+def _get_hresult_info(hresult):  # type: (int) -> Tuple[str, str]
+    """Looks up a WUA HRESULT in the known error table.
 
     Windows doesn't offer an automatic way to get an error message from a WUA HRESULT. This method is used to convert
     those results to a human readable error message based on the values extracted from wuerror.h from the Windows SDK.
@@ -74,11 +76,12 @@ def _get_hresult_error(hresult):  # type: (int) -> str
         hresult (int): The HRESULT to convert.
 
     Returns:
-        (str): The error message for the HRESULT
+        (Tuple[str, str]): The symbolic error id (e.g. C(WU_E_PT_EXCEEDED_MAX_SERVER_TRIPS)) and its human readable
+        description. C(('UNKNOWN', ...)) when the HRESULT isn't in the table.
     """
     # The code exists here so we don't have to transfer all this data when kicking off some updates.
 
-    error_id, error_msg = {
+    return {
         0x00240001: ('WU_S_SERVICE_STOP', 'Windows Update Agent was stopped successfully'),
         0x00240002: ('WU_S_SELFUPDATE', 'Windows Update Agent updated itself'),
         0x00240003: ('WU_S_UPDATE_ERROR', 'Operation completed successfully but there were errors applying the updates'),
@@ -633,7 +636,43 @@ def _get_hresult_error(hresult):  # type: (int) -> str
         0x8024B9FF: ('WU_E_EVALUATOR_UNEXPECTED', 'An unexpected error occurred while processing an evaluation request'),
     }.get(hresult, ('UNKNOWN', 'Unknown WUA HRESULT %s' % hresult))
 
+
+def _get_hresult_error(hresult):  # type: (int) -> str
+    """Converts a WUA HRESULT to a human readable error message.
+
+    Args:
+        hresult (int): The HRESULT to convert.
+
+    Returns:
+        (str): The error message for the HRESULT
+    """
+    error_id, error_msg = _get_hresult_info(hresult)
     return '%s (%s 0x%08X)' % (error_msg, error_id, hresult & 0xFFFFFFFF)
+
+
+# HRESULT ranges that are a transport-level failure talking to the configured
+# update endpoint (WSUS or Microsoft Update), not a WUA/content problem:
+# resetting the WinRM connection and replaying the same search/install cannot
+# fix these, the caller needs to look at the update source itself. See
+# https://learn.microsoft.com/en-us/windows/deployment/update/windows-update-error-reference
+_TRANSPORT_HRESULT_RANGES = (
+    (0x80244000, 0x80244FFF),  # "Protocol Talker" / WU_E_PT_* errors
+)
+
+
+def _categorize_hresult(error_id, hresult):  # type: (str, int) -> str
+    """Groups a known WUA HRESULT into a coarse, locale-independent category a
+    caller can branch on instead of parsing the English C(msg)/C(exception)
+    text. Only covers the categories this module can tell apart reliably from
+    the HRESULT alone; anything else is C(unknown) and callers still need to
+    make their own judgement call, same as before this field existed.
+    """
+    masked = hresult & 0xFFFFFFFF
+    if error_id.startswith('WU_E_PT_') or any(low <= masked <= high for low, high in _TRANSPORT_HRESULT_RANGES):
+        return 'transport'
+    if error_id == 'WU_E_SERVICE_STOP':
+        return 'service_stopped'
+    return 'unknown'
 
 
 class _ReturnResultException(Exception):
@@ -657,10 +696,14 @@ class ActionModule(ActionBase):
         'server_selection',
         'state',
         'maximum_retries_on_failed_updates',
+        'connection_retries',
+        'connection_retry_delay',
         '_operation',  # Internal use only. Used in CI tests
     ]
 
     DEFAULT_REBOOT_TIMEOUT = 1200
+    DEFAULT_CONNECTION_RETRIES = 2
+    DEFAULT_CONNECTION_RETRY_DELAY = 0
 
     def __init__(self, *args, **kwargs):
         super(ActionModule, self).__init__(*args, **kwargs)
@@ -692,6 +735,21 @@ class ActionModule(ActionBase):
         except TypeError as e:
             raise AnsibleActionFail("Invalid value given for 'reboot_timeout': %s." % to_native(e))
 
+        try:
+            connection_retries = check_type_int(
+                self._task.args.get('connection_retries', self.DEFAULT_CONNECTION_RETRIES))
+        except TypeError as e:
+            raise AnsibleActionFail("Invalid value given for 'connection_retries': %s." % to_native(e))
+
+        if connection_retries < 1:
+            raise AnsibleActionFail("'connection_retries' must be at least 1.")
+
+        try:
+            connection_retry_delay = check_type_int(
+                self._task.args.get('connection_retry_delay', self.DEFAULT_CONNECTION_RETRY_DELAY))
+        except TypeError as e:
+            raise AnsibleActionFail("Invalid value given for 'connection_retry_delay': %s." % to_native(e))
+
         module_options = self._task.args.copy()
 
         operation_val = module_options.pop('_operation', None)
@@ -717,7 +775,12 @@ class ActionModule(ActionBase):
 
         else:
             try:
-                result = self._run_sync(task_vars, module_options, reboot, reboot_timeout, for_testing=for_testing)
+                result = self._run_sync(
+                    task_vars, module_options, reboot, reboot_timeout,
+                    connection_retries=connection_retries,
+                    connection_retry_delay=connection_retry_delay,
+                    for_testing=for_testing,
+                )
             except Exception as e:
                 result = {}
                 if isinstance(e, _ReturnResultException):
@@ -765,8 +828,9 @@ class ActionModule(ActionBase):
 
         return result
 
-    def _run_sync(self, task_vars, module_options, reboot, reboot_timeout, for_testing=False):
-        # type: (Dict, Dict, bool, int, bool) -> Dict
+    def _run_sync(self, task_vars, module_options, reboot, reboot_timeout,
+                   connection_retries=2, connection_retry_delay=0, for_testing=False):
+        # type: (Dict, Dict, bool, int, int, int, bool) -> Dict
         """Installs the updates in a synchronous fashion with multiple update invocations if needed."""
         # In case we are running with become we need to make sure the module uses the correct dir
         result = {
@@ -782,7 +846,12 @@ class ActionModule(ActionBase):
             attempt_round += 1
             display.v("Running win_updates - round %s" % attempt_round, host=task_vars.get('inventory_hostname', None))
 
-            update_result = self._run_updates(task_vars, module_options, for_testing=for_testing)
+            update_result = self._run_updates(
+                task_vars, module_options,
+                connection_retries=connection_retries,
+                connection_retry_delay=connection_retry_delay,
+                for_testing=for_testing,
+            )
 
             self._updates.update(update_result.updates)
             self._filtered_updates.update(update_result.filtered_updates)
@@ -812,6 +881,8 @@ class ActionModule(ActionBase):
                     self._install_results[update_id]['hresult'] = -1
 
                 result['failed'] = True
+                result['error_id'] = 'update_loop_detected'
+                result['failure_category'] = 'update_loop_detected'
                 result['msg'] = (
                     'An update loop was detected, this could be caused by an update being rolled back during a '
                     'reboot or the Windows Update API incorrectly reporting a failed update as being successful.'
@@ -826,8 +897,10 @@ class ActionModule(ActionBase):
 
             if update_result.failed:
                 msg = update_result.msg
+                error_id = None
                 if update_result.hresult:
-                    msg += " - " + _get_hresult_error(update_result.hresult)
+                    error_id, hresult_msg = _get_hresult_info(update_result.hresult)
+                    msg += ' - %s (%s 0x%08X)' % (hresult_msg, error_id, update_result.hresult)
 
                 # A failure could indicate a reboot was required from a previous install or just a faulty WUA. When
                 # reboot=True we should at least attempt to reboot once before considering it a failure.
@@ -841,6 +914,10 @@ class ActionModule(ActionBase):
                     result['failed'] = True
                     result['msg'] = msg
                     result['exception'] = update_result.exception
+                    if update_result.hresult:
+                        result['hresult'] = update_result.hresult
+                        result['error_id'] = error_id
+                        result['failure_category'] = _categorize_hresult(error_id, update_result.hresult)
                     break
 
             elif reboot:
@@ -896,8 +973,8 @@ class ActionModule(ActionBase):
 
         return result
 
-    def _run_updates(self, task_vars, module_options, for_testing=False):
-        # type: (Dict, Dict, bool) -> UpdateResult
+    def _run_updates(self, task_vars, module_options, connection_retries=2, connection_retry_delay=0, for_testing=False):
+        # type: (Dict, Dict, int, int, bool) -> UpdateResult
         """Runs the win_updates module and returns the raw results from that task."""
         inventory_hostname = task_vars.get('inventory_hostname', None)
 
@@ -922,6 +999,8 @@ class ActionModule(ActionBase):
                     operation="poll",
                     operation_options=poll_options,
                     retry_on_failure=True,
+                    connection_retries=connection_retries,
+                    connection_retry_delay=connection_retry_delay,
                 )
 
                 for progress in poll_result['output']:
@@ -962,7 +1041,9 @@ class ActionModule(ActionBase):
         operation="start",
         operation_options=None,
         retry_on_failure=False,
-    ):  # type: (Dict, Optional[Dict], str, Optional[Dict], bool) -> Dict
+        connection_retries=2,
+        connection_retry_delay=0,
+    ):  # type: (Dict, Optional[Dict], str, Optional[Dict], bool, int, int) -> Dict
         final_options = (module_options or {}).copy()
         final_options["_operation"] = operation
         final_options["_operation_options"] = operation_options or {}
@@ -971,9 +1052,13 @@ class ActionModule(ActionBase):
         # When polling the output, ignore connection/timeout failures and try
         # again in case it was a temporary error. We can only do this during
         # the polling stage as that's the only time we can ignore a dropped
-        # progress message.
+        # progress message. The number of attempts (and an optional delay
+        # between them) is caller-configurable through connection_retries/
+        # connection_retry_delay, since a single retry (the previous fixed
+        # behaviour) isn't always enough to outlast a longer WinRM blip.
+        attempts = connection_retries if retry_on_failure else 1
         result = {}
-        for idx in range(2):
+        for idx in range(attempts):
             try:
                 result = self._execute_module(
                     module_name='ansible.windows.win_updates',
@@ -982,10 +1067,15 @@ class ActionModule(ActionBase):
                 )
                 break
             except (AnsibleConnectionFailure, RequestTimeoutException) as e:
-                if not retry_on_failure or idx == 1:
+                if not retry_on_failure or idx == attempts - 1:
                     raise
 
-                display.warning("Connection failure when polling update result - attempting to retry: %s" % to_text(e))
+                display.warning(
+                    "Connection failure when polling update result - attempting to retry (%d/%d): %s"
+                    % (idx + 2, attempts, to_text(e))
+                )
+                if connection_retry_delay:
+                    time.sleep(connection_retry_delay)
 
         if 'invocation' in result and not self._invocation:
             # First run through we want to update the invocation value in the final results
@@ -1034,7 +1124,9 @@ class ActionModule(ActionBase):
                     info[action] = True
 
                 else:
+                    error_id, _error_msg = _get_hresult_info(action_info['hresult'])
                     info['failure_hresult_code'] = action_info['hresult']
+                    info['failure_error_id'] = error_id
                     info['failure_msg'] = _get_hresult_error(action_info['hresult'])
 
         return info
